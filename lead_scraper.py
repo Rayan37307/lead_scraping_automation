@@ -582,36 +582,49 @@ async def scrape_google_dork(
 
         # CAPTCHA DETECTION AND MANUAL SOLVE LOOP
         while True:
-            captcha_form = await page.query_selector("form#captcha-form")
-            captcha_iframe = await page.query_selector("iframe[src*='google.com/recaptcha']")
-            
-            # Additional check: If no results AND we see typical captcha text
-            page_text = await page.content()
-            is_blocked = "Our systems have detected unusual traffic" in page_text or "not a robot" in page_text
-            
-            if captcha_form or captcha_iframe or is_blocked:
-                print("\n" + "!" * 60)
-                print("  [ACTION REQUIRED] GOOGLE CAPTCHA DETECTED!")
-                print("  Please solve the CAPTCHA in the browser window.")
-                print("  The bot will wait and check every 10 seconds.")
-                print("!" * 60 + "\n")
+            try:
+                captcha_form = await page.query_selector("form#captcha-form")
+                captcha_iframe = await page.query_selector("iframe[src*='google.com/recaptcha']")
                 
-                logger.warning("Google CAPTCHA detected. Waiting for manual resolution...")
+                # Additional check: If no results AND we see typical captcha text
+                page_text = await page.content()
+                is_blocked = "Our systems have detected unusual traffic" in page_text or "not a robot" in page_text
                 
-                # If headless, we should probably warn that it's hard to solve
-                if headless:
-                    logger.error("Headless mode is ON. CAPTCHA cannot be solved manually easily.")
-                    logger.info("Consider restarting without headless mode (-n).")
-                
-                await asyncio.sleep(10)
-                # Re-check in the next iteration of the while loop
-            else:
-                # No captcha detected, or it was solved
-                if "Our systems have detected unusual traffic" not in await page.content():
-                    logger.info("No CAPTCHA detected or CAPTCHA solved. Proceeding...")
-                    break
-                else:
+                if captcha_form or captcha_iframe or is_blocked:
+                    print("\n" + "!" * 60)
+                    print("  [ACTION REQUIRED] GOOGLE CAPTCHA DETECTED!")
+                    print("  Please solve the CAPTCHA in the browser window.")
+                    print("  The bot will wait and check every 10 seconds.")
+                    print("!" * 60 + "\n")
+                    
+                    logger.warning("Google CAPTCHA detected. Waiting for manual resolution...")
+                    
+                    # If headless, we should probably warn that it's hard to solve
+                    if headless:
+                        logger.error("Headless mode is ON. CAPTCHA cannot be solved manually easily.")
+                        logger.info("Consider restarting without headless mode (-n).")
+                    
                     await asyncio.sleep(10)
+                    # Re-check in the next iteration of the while loop
+                else:
+                    # No captcha detected, or it was solved
+                    # Wait a moment for page to stabilize after navigation
+                    await asyncio.sleep(2)
+                    if "Our systems have detected unusual traffic" not in await page.content():
+                        logger.info("No CAPTCHA detected or CAPTCHA solved. Proceeding...")
+                        break
+                    else:
+                        await asyncio.sleep(10)
+            except Exception as e:
+                # Handle "Execution context was destroyed" which happens during navigation
+                if "destroyed" in str(e) or "navigation" in str(e).lower():
+                    logger.debug("Page navigating, waiting for stability...")
+                    await asyncio.sleep(5)
+                    continue
+                else:
+                    logger.warning(f"Error during CAPTCHA check: {e}")
+                    await asyncio.sleep(5)
+                    continue
 
         logger.info(f"Scraping results (max: {max_scrolls} scrolls)")
 
@@ -625,34 +638,68 @@ async def scrape_google_dork(
             await asyncio.sleep(2)
 
             try:
-                # Broader selectors for Google results
-                result_blocks = await page.query_selector_all("div.g, div.tF2Cxc, div.kvG71c, div.yuRUbf")
+                # Even broader selectors for Google results
+                result_blocks = await page.query_selector_all("div.g, div.tF2Cxc, div.kvG71c, div.yuRUbf, div.MjjYud, .sr__group")
+                
+                if not result_blocks:
+                    # Final fallback: try to find anything that looks like a result block
+                    result_blocks = await page.query_selector_all("#search .v7W49e > div, #rso > div")
+
                 new_count = 0
+                logger.debug(f"Found {len(result_blocks)} potential result blocks")
 
                 for block in result_blocks:
                     try:
                         text = await block.inner_text()
+                        if not text or len(text) < 20:
+                            continue
                         
                         # Extract basic info
                         title_elem = await block.query_selector("h3")
+                        # Find the main link - usually the one containing the h3 or nearby
                         link_elem = await block.query_selector("a")
                         
-                        if not link_elem:
-                            continue
-                            
-                        href = await link_elem.get_attribute("href")
-                        if not href or not href.startswith("http") or "google.com" in href:
+                        # Better link detection: look for the one with the most text or an h3
+                        all_links = await block.query_selector_all("a")
+                        href = ""
+                        for l in all_links:
+                            h = await l.get_attribute("href")
+                            if h and h.startswith("http") and "google.com" not in h:
+                                # Prioritize the link that contains the h3
+                                inner_h3 = await l.query_selector("h3")
+                                if inner_h3:
+                                    href = h
+                                    link_elem = l
+                                    break
+                                if not href: # Fallback to first valid link
+                                    href = h
+                                    link_elem = l
+
+                        if not href:
                             continue
                             
                         # If it's a social media site, validate it's a profile, not a generic page
+                        # For DORKING, we can be a bit more lenient if they used site: filter
                         is_social = any(s in href.lower() for s in ["facebook.com", "instagram.com", "fb.com"])
-                        if is_social and not is_valid_profile_url(href):
-                            continue
+                        if is_social:
+                            # If it's social, we still want to filter out help/login pages
+                            # But we'll allow things like /p/ or /reel/ if they have an email in the snippet
+                            if not is_valid_profile_url(href):
+                                # Check if it has an email in the snippet before skipping
+                                if not re.search(EMAIL_REGEX, text):
+                                    continue
 
-                        # Dedup by URL
+                        # Dedup by URL - but allow update if we find an email for a profile that didn't have one
+                        existing_index = -1
                         if href in seen_profiles:
-                            continue
-                        seen_profiles.add(href)
+                            for i, r in enumerate(results):
+                                if r["Website"] == href and not r["Email"]:
+                                    existing_index = i
+                                    break
+                            if existing_index == -1:
+                                continue
+                        else:
+                            seen_profiles.add(href)
 
                         result = {
                             "Business Name": "",
@@ -665,14 +712,20 @@ async def scrape_google_dork(
                         if title_elem:
                             result["Business Name"] = (await title_elem.inner_text()).strip()[:100]
                         
-                        if not result["Business Name"] and href:
+                        if not result["Business Name"]:
                             # Fallback to parts of URL for business name
                             clean_name = href.split("/")[-1] or href.split("/")[-2] or "Unknown"
                             result["Business Name"] = clean_name.replace("-", " ").replace(".", " ").title()[:100]
 
-                        # Extract emails
+                        # Robust email extraction (handles some obfuscation)
                         emails = re.findall(EMAIL_REGEX, text)
+                        if not emails:
+                            text_clean = text.replace(" (at) ", "@").replace("[at]", "@").replace("(at)", "@").replace(" at ", "@")
+                            text_clean = text_clean.replace(" dot ", ".").replace("[dot]", ".").replace("(dot)", ".")
+                            emails = re.findall(EMAIL_REGEX, text_clean)
+
                         valid_emails = [e.lower() for e in emails if not e.lower().endswith("@example.com")]
+                        
                         if valid_emails:
                             result["Email"] = valid_emails[0]
                             for e in valid_emails:
@@ -683,19 +736,25 @@ async def scrape_google_dork(
                         if phones:
                             result["Phone Number"] = phones[0].strip()
                         else:
-                            # Try BD specific if not found
                             bd_phones = re.findall(BD_PHONE_REGEX, text)
                             if bd_phones:
                                 result["Phone Number"] = bd_phones[0].strip()
 
-                        # If we have a valid profile/website and a name, or an email, it's a valid lead
-                        if result["Email"] or (result["Business Name"] and result["Website"]):
-                            results.append(result)
-                            new_count += 1
-                            if result["Email"]:
-                                logger.info(f"  + Lead: {result['Business Name'][:30]} | {result['Email']}")
-                            else:
-                                logger.info(f"  + Lead: {result['Business Name'][:30]} | Profile: {result['Website'][:30]}")
+                        # If we found an email for an existing profile, update it
+                        if existing_index != -1 and result["Email"]:
+                            results[existing_index]["Email"] = result["Email"]
+                            if not results[existing_index]["Phone Number"]:
+                                results[existing_index]["Phone Number"] = result["Phone Number"]
+                            logger.info(f"  * Updated Lead: {results[existing_index]['Business Name'][:30]} | {result['Email']}")
+                        elif existing_index == -1:
+                            # If we have a valid profile/website and a name, or an email, it's a valid lead
+                            if result["Email"] or (result["Business Name"] and result["Website"]):
+                                results.append(result)
+                                new_count += 1
+                                if result["Email"]:
+                                    logger.info(f"  + Lead: {result['Business Name'][:30]} | {result['Email']}")
+                                else:
+                                    logger.info(f"  + Lead: {result['Business Name'][:30]} | Profile: {result['Website'][:30]}")
 
                     except Exception as e:
                         logger.debug(f"Failed to process result block: {e}")
@@ -1057,10 +1116,24 @@ async def main() -> None:
         logger.warning("No results found. Check your search parameters.")
         return
 
-    df = process_and_clean_data(raw_results)
-    logger.info(f"After processing: {len(df)} valid leads")
-
     output_file = "leads_output.xlsx"
+    all_results = raw_results
+
+    # Load existing data to append
+    if os.path.exists(output_file):
+        try:
+            existing_df = pd.read_excel(output_file)
+            # Fill NaN with empty string to match our processing logic
+            existing_df = existing_df.fillna("")
+            existing_records = existing_df.to_dict("records")
+            all_results = existing_records + raw_results
+            logger.info(f"Loaded {len(existing_records)} existing leads from {output_file}")
+        except Exception as e:
+            logger.warning(f"Could not read existing {output_file}: {e}")
+
+    df = process_and_clean_data(all_results)
+    logger.info(f"After processing and deduplication: {len(df)} total leads")
+
     df.to_excel(output_file, index=False, engine="openpyxl")
 
     logger.info(f"Results exported to {output_file}")
