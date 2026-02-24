@@ -1085,6 +1085,12 @@ async def main() -> None:
     print(f"  Results Limit: {SEARCH_CONFIG['results_limit']}")
     print("=" * 60 + "\n")
 
+    custom_output = input("Enter output file name (default: leads_output.xlsx): ").strip()
+    if not custom_output:
+        output_file = "leads_output.xlsx"
+    else:
+        output_file = custom_output if custom_output.endswith(".xlsx") else f"{custom_output}.xlsx"
+
     logger.info("Initializing browser...")
 
     raw_results: list[dict[str, str]] = []
@@ -1109,37 +1115,36 @@ async def main() -> None:
         print("\n[!] Scraping interrupted by user")
     except Exception as e:
         logger.error(f"Error during scraping: {e}")
+    finally:
+        if not raw_results:
+            logger.warning("No results found. Check your search parameters.")
+            return
 
-    logger.info(f"Scraping finished! Total raw results: {len(raw_results)}")
+        logger.info(f"Scraping finished or interrupted! Total raw results: {len(raw_results)}")
 
-    if not raw_results:
-        logger.warning("No results found. Check your search parameters.")
-        return
+        all_results = raw_results
 
-    output_file = "leads_output.xlsx"
-    all_results = raw_results
+        # Load existing data to append
+        if os.path.exists(output_file):
+            try:
+                existing_df = pd.read_excel(output_file)
+                # Fill NaN with empty string to match our processing logic
+                existing_df = existing_df.fillna("")
+                existing_records = existing_df.to_dict("records")
+                all_results = existing_records + raw_results
+                logger.info(f"Loaded {len(existing_records)} existing leads from {output_file}")
+            except Exception as e:
+                logger.warning(f"Could not read existing {output_file}: {e}")
 
-    # Load existing data to append
-    if os.path.exists(output_file):
-        try:
-            existing_df = pd.read_excel(output_file)
-            # Fill NaN with empty string to match our processing logic
-            existing_df = existing_df.fillna("")
-            existing_records = existing_df.to_dict("records")
-            all_results = existing_records + raw_results
-            logger.info(f"Loaded {len(existing_records)} existing leads from {output_file}")
-        except Exception as e:
-            logger.warning(f"Could not read existing {output_file}: {e}")
+        df = process_and_clean_data(all_results)
+        logger.info(f"After processing and deduplication: {len(df)} total leads")
 
-    df = process_and_clean_data(all_results)
-    logger.info(f"After processing and deduplication: {len(df)} total leads")
+        df.to_excel(output_file, index=False, engine="openpyxl")
 
-    df.to_excel(output_file, index=False, engine="openpyxl")
-
-    logger.info(f"Results exported to {output_file}")
-    print("=" * 60)
-    print("\nSample results:")
-    print(df.head(10).to_string())
+        logger.info(f"Results exported to {output_file}")
+        print("=" * 60)
+        print("\nSample results:")
+        print(df.head(10).to_string())
 
 
 if __name__ == "__main__":
